@@ -10,18 +10,17 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 
 # --- XHTML2PDF FOR PDF GENERATION ---
-# Imports the library required to convert the dynamically generated HTML into a PDF file.
 try:
     from xhtml2pdf import pisa
 except ImportError:
     print("ERROR: You must install xhtml2pdf! Run: pip install xhtml2pdf")
     sys.exit(1)
 
-# SQLAlchemy imports for ORM (Object Relational Mapper) database management
+# SQLAlchemy imports
 from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, Float
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-# PyQt6 imports for the Graphical User Interface (GUI)
+# PyQt6 imports
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QTableWidget, QTableWidgetItem, QPushButton, QLabel, QLineEdit, 
                              QSplitter, QListWidget, QListWidgetItem, QDialog, QFormLayout, 
@@ -29,30 +28,49 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QComboBox, QMenu, QFileDialog)
 from PyQt6.QtCore import Qt, QRunnable, QThreadPool, pyqtSignal, QObject, pyqtSlot, QSettings
 from PyQt6.QtGui import QColor, QPalette, QAction, QFont, QIcon
-import qtawesome as qta  # Library for vector icons (FontAwesome)
+import qtawesome as qta 
+
+# =============================================================================
+# 0. HELPERS (PRICE PARSING)
+# =============================================================================
+def safe_parse_price(price_str):
+    """
+    Safely converts a price string (e.g., '€ 1.200,50' or '$1,200.50') into a float.
+    Handles EU/US decimal separators automatically.
+    """
+    if not price_str: return 0.0
+    
+    # Remove currency symbols and spaces, keep digits, dots, and commas
+    clean = re.sub(r'[^\d.,]', '', str(price_str))
+    
+    if not clean: return 0.0
+
+    # Heuristic for separators
+    if ',' in clean and '.' in clean:
+        if clean.find(',') < clean.find('.'):
+            clean = clean.replace(',', '') # US Format (1,000.00)
+        else:
+            clean = clean.replace('.', '').replace(',', '.') # EU Format (1.000,00)
+    elif ',' in clean:
+        clean = clean.replace(',', '.') # Assume comma is decimal
+    
+    try:
+        return float(clean)
+    except ValueError:
+        return 0.0
 
 # =============================================================================
 # 1. CURRENCY MANAGER
 # =============================================================================
 class CurrencyManager:
-    """
-    Manages the USD -> EUR exchange rate.
-    Uses a caching mechanism to prevent excessive API calls.
-    """
     _rate = None
     _last_update = 0
     
     @staticmethod
     def get_usd_to_eur():
-        """
-        Retrieves the current exchange rate.
-        If the cached rate is older than 24 hours (86400s), it fetches a new one.
-        """
         now = time.time()
-        # Update if rate is missing or older than 1 day
         if CurrencyManager._rate is None or (now - CurrencyManager._last_update) > 86400:
             try:
-                # Free public API for exchange rates
                 url = "https://open.er-api.com/v6/latest/USD"
                 response = requests.get(url, timeout=5)
                 if response.status_code == 200:
@@ -60,45 +78,35 @@ class CurrencyManager:
                     CurrencyManager._rate = data['rates']['EUR']
                     CurrencyManager._last_update = now
             except Exception as e:
-                # Fallback in case of network error
                 if CurrencyManager._rate is None: 
-                    CurrencyManager._rate = 0.92  # Default static fallback
-                    QMessageBox.warning(None, "Error retrieving €/$ exchange rate", f"Error: {e}")
-                    
+                    CurrencyManager._rate = 0.92 
+                    print(f"Error retrieving rate: {e}")
         return CurrencyManager._rate
 
 # =============================================================================
-# 2. DATABASE MODELS (SQLAlchemy)
+# 2. DATABASE MODELS
 # =============================================================================
 Base = declarative_base()
 
 class Project(Base):
-    """
-    Table to store Projects.
-    """
     __tablename__ = 'projects'
     id = Column(Integer, primary_key=True)
-    name = Column(String, unique=True) # Project name must be unique
-    notes = Column(Text, default="")   # Free text notes
-    # One-to-Many relationship: One project has many components
+    name = Column(String, unique=True)
+    notes = Column(Text, default="")
     components = relationship("Component", back_populates="project", cascade="all, delete-orphan")
 
 class Component(Base):
-    """
-    Table to store individual Electronic Components.
-    """
     __tablename__ = 'components'
     id = Column(Integer, primary_key=True)
-    project_id = Column(Integer, ForeignKey('projects.id')) # Foreign Key to Project
+    project_id = Column(Integer, ForeignKey('projects.id'))
     
-    mouser_part_number = Column(String) # Code for Mouser API
-    jlc_part_number = Column(String)    # Code for LCSC/JLCPCB scraping
+    mouser_part_number = Column(String)
+    jlc_part_number = Column(String)
     description = Column(String)
     category = Column(String, default="Other")
-    target_qty = Column(Integer, default=1) # Required quantity per board
+    target_qty = Column(Integer, default=1)
     backup_part = Column(String, nullable=True)
     
-    # Cache Fields: Store the last fetched data for offline/fast usage
     last_mouser_stock = Column(Integer, default=-1)
     last_mouser_price = Column(Float, default=0.0) 
     last_jlc_stock = Column(Integer, default=-1)
@@ -107,136 +115,122 @@ class Component(Base):
     
     project = relationship("Project", back_populates="components")
 
-# Categories for the dropdown menu
 CATEGORIES = ["All", "Resistor", "Capacitor", "Inductor", "IC", "Microcontroller", 
               "Connector", "Transistor", "Diode", "Sensor", "Module", "Other"] 
 
 def init_db(db_path):
-    """
-    Initializes the connection to the SQLite database.
-    Creates tables if they do not exist.
-    Returns a session factory to interact with the DB.
-    """
-    if not os.path.exists(db_path):
-        pass # The file will be created by create_engine if it doesn't exist
-
+    if not os.path.exists(db_path): pass
     db_url = f"sqlite:///{db_path}"
     engine = create_engine(db_url)
-    Base.metadata.create_all(engine) # Generates schema
+    Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)
 
 # =============================================================================
-# 3. SEARCH FUNCTIONS (SCRAPING & API)
+# 3. SEARCH FUNCTIONS (UPDATED & ROBUST)
 # =============================================================================
 
 def get_jlcpcb_stats(code, qnty):
     """
-    Scrapes the JLCPCB part detail page to get stock and pricing.
-    Input: LCSC Code (e.g., C1234), Required Total Quantity.
-    Output: [Available Stock, Total Price in EUR]
+    Robust scraping using cloudscraper and flexible parsing.
     """
     if not code: return [-1, 0.0]
-    headers = {'User-Agent': 'Mozilla/5.0 ...'} # User agent to avoid basic blocks
+    
     url = "https://jlcpcb.com/partdetail/" + code
+    
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status() 
-    except: return [-1, 0.0]
+        scraper = cloudscraper.create_scraper() 
+        response = scraper.get(url, timeout=15)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"JLCPCB Connection Error for {code}: {e}")
+        return [-1, 0.0]
 
     soup = BeautifulSoup(response.text, 'html.parser')
-    
-    # 1. Extract Stock
-    stock_element = soup.find('div', class_='text-16 font-bold') 
-    quantity = 0; total_price_usd = 0.0
+    quantity = 0
+    total_price_usd = 0.0
 
-    if stock_element:
-        try:
-            stock_text = stock_element.get_text(strip=True)
-            # Cleans string to find the number (e.g., "Stock: 12,000")
-            if ":" in stock_text: quantity = int(stock_text.replace(',', '').split(":")[1])
-            else: quantity = int(''.join(filter(str.isdigit, stock_text)))
-        except: quantity = 0
+    # 1. Stock Parsing
+    try:
+        stock_label = soup.find(string=re.compile("Stock", re.IGNORECASE))
+        if stock_label:
+            parent_text = stock_label.parent.get_text()
+            quantity = int(''.join(filter(str.isdigit, parent_text)))
+    except: quantity = 0
     
-    # 2. Extract Price (Tiered Pricing Table)
-    # Finds the div containing prices
-    cost_div = soup.find('div', class_='mt-10 bg-[#f8f8f8] py-10 px-30')
-    if cost_div:
-        cost_text = cost_div.get_text()        
-        # Regex to find quantities (e.g., 1+, 10+, 100+)
-        quant = list(map(lambda x: int(x.replace(',', '')), re.findall(r'(\d{1,3}(?:\d{3})*)\+', cost_text)))
-        # Regex to find prices (e.g., $0.50)
-        cost = list(map(float, re.findall(r'\$(\d+\.\d+)', cost_text)))
+    # 2. Price Parsing
+    try:
+        price_section = soup.find('div', class_=re.compile(r'price|cost', re.IGNORECASE))
+        if not price_section: price_section = soup
+        text_content = price_section.get_text()
         
-        # Maps quantity to price and sorts
-        tiers = sorted(zip(quant, cost), key=lambda x: x[0])
+        matches = re.findall(r'(\d+)\+\s*\$(\d+\.\d+)', text_content)
+        tiers = []
+        for qty_str, price_str in matches:
+            tiers.append((int(qty_str), float(price_str)))
+        tiers.sort(key=lambda x: x[0])
+        
         if tiers:
-            target_unit_price = tiers[0][1] # Base price
-            # Finds the correct tier for the requested quantity
+            target_unit_price = tiers[0][1]
             for qty_tier, price_tier in tiers:
                 if qnty >= qty_tier: target_unit_price = price_tier
                 else: break 
             total_price_usd = qnty * target_unit_price
+    except: pass
 
-    # Converts to Euro before returning
     return [quantity, total_price_usd * CurrencyManager.get_usd_to_eur()]
 
 def get_mouser_stats(part_number, qty, api_key):
     """
-    Queries the Mouser Search API.
-    Input: Part Number, Quantity, API Key.
-    Output: [Stock, Total Price in EUR]
+    Mouser API with Price Parsing Fix and PN Matching.
     """
     if not part_number or not api_key: return [-1, 0.0]
     url = f"https://api.mouser.com/api/v1/search/keyword?apiKey={api_key}"
     headers = {'Content-Type': 'application/json'}
-    # Payload for Mouser Search API v1
-    body = {"SearchByKeywordRequest": {"keyword": part_number, "records": 1, "startingRecord": 0, "searchOptions": "None"}}
+    body = {"SearchByKeywordRequest": {"keyword": part_number, "records": 5, "startingRecord": 0, "searchOptions": "None"}}
     
     try:
-        r = requests.post(url, json=body, headers=headers, timeout=5)
+        r = requests.post(url, json=body, headers=headers, timeout=10)
         if r.status_code == 200:
             data = r.json()
             if data.get('Errors'): return [-1, 0.0]
             
             results = data.get('SearchResults', {}).get('Parts', [])
             if results:
-                part = results[0] # Takes the first result
+                # Find the best match
+                part = results[0] 
                 
-                # Parsing Stock
+                # Verify PN match (Case insensitive)
+                for res in results:
+                    if part_number.lower() in res.get('MouserPartNumber', '').lower():
+                        part = res
+                        break
+                
                 avail_str = str(part.get('Availability', '0'))
                 if avail_str == 'None': avail_str = str(part.get('FactoryStock', '0'))
                 stock = int(''.join(filter(str.isdigit, avail_str)) or 0)
                 
-                # Parsing Price (PriceBreaks)
                 price_unit = 0.0
                 breaks = part.get('PriceBreaks', [])
                 for pb in breaks:
-                    # Finds the correct price tier
                     if qty >= int(pb.get('Quantity', 99999)):
-                        try: price_unit = float(pb.get('Price', '0').replace('€','').replace('$','').replace(',','.').strip())
-                        except: pass
+                        price_unit = safe_parse_price(pb.get('Price', '0'))
                 
-                # If no tier found, use the first available one
                 if price_unit == 0 and breaks:
-                     try: price_unit = float(breaks[0].get('Price', '0').replace('€','').replace('$','').replace(',','.').strip())
-                     except: pass
+                     price_unit = safe_parse_price(breaks[0].get('Price', '0'))
                      
                 return [stock, price_unit * qty]
-    except: pass
+    except Exception as e:
+        print(f"Mouser API Error: {e}")
+        
     return [-1, 0.0]
 
 # =============================================================================
-# 4. UPDATE THREAD (Multithreading)
+# 4. WORKER THREAD
 # =============================================================================
 class WorkerSignals(QObject):
-    """Signals to communicate from the worker thread to the GUI."""
     result = pyqtSignal(dict) 
 
 class DataUpdater(QRunnable):
-    """
-    Worker executed in a separate thread (QThreadPool).
-    Prevents GUI freezing during network requests.
-    """
     def __init__(self, component_id, mouser_pn, jlc_pn, qty):
         super().__init__()
         self.c_id = component_id; self.m_pn = mouser_pn; self.j_pn = jlc_pn; self.qty = qty
@@ -244,12 +238,9 @@ class DataUpdater(QRunnable):
 
     @pyqtSlot()
     def run(self):
-        """Executes requests to Mouser and JLCPCB conceptually in parallel."""
         m_res = get_mouser_stats(self.m_pn, self.qty, self.settings.value("mouser_key", "").strip())
         j_res = get_jlcpcb_stats(self.j_pn, self.qty)
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        
-        # Emits data to GUI via signal
         self.signals.result.emit({
             'id': self.c_id, 
             'mouser_stock': m_res[0], 'mouser_price': m_res[1], 
@@ -258,10 +249,9 @@ class DataUpdater(QRunnable):
         })
 
 # =============================================================================
-# 5. UI: NOTES DIALOG
+# 5. UI DIALOGS
 # =============================================================================
 class NotesDialog(QDialog):
-    """Simple window to edit project text notes."""
     def __init__(self, parent=None, project=None):
         super().__init__(parent)
         self.setWindowTitle(f"Project Notes: {project.name}")
@@ -276,24 +266,16 @@ class NotesDialog(QDialog):
 
     def save_and_close(self):
         self.project.notes = self.txt.toPlainText()
-        self.session.commit() # Save to DB
+        self.session.commit()
         self.accept()
 
-# =============================================================================
-# 6. UI: COMPONENTS AND SETTINGS
-# =============================================================================
 class ComponentDialog(QDialog):
-    """
-    Dialog to Add or Edit a component.
-    Shows fields for PN, Description, Quantity, etc.
-    """
     def __init__(self, parent=None, component=None):
         super().__init__(parent)
         self.setWindowTitle("Component Details")
         self.resize(500, 450)
         self.layout = QFormLayout(self)
         
-        # Widget Definitions
         self.inp_cat = QComboBox(); self.inp_cat.addItems(CATEGORIES[1:])
         self.inp_m_pn = QLineEdit()
         self.inp_j_pn = QLineEdit(); self.inp_j_pn.setPlaceholderText("Ex. C7593")
@@ -301,7 +283,6 @@ class ComponentDialog(QDialog):
         self.inp_qty = QLineEdit("1")
         self.inp_backup = QLineEdit()
         
-        # If editing, populate fields with existing data
         if component:
             self.inp_m_pn.setText(component.mouser_part_number.replace("\n","") if component.mouser_part_number else "")
             self.inp_j_pn.setText(component.jlc_part_number.replace("\n","") if component.jlc_part_number else "")
@@ -311,7 +292,6 @@ class ComponentDialog(QDialog):
             idx = self.inp_cat.findText(component.category)
             if idx >= 0: self.inp_cat.setCurrentIndex(idx)
         
-        # Add rows to form
         self.layout.addRow("Category:", self.inp_cat)
         self.layout.addRow("Mouser PN:", self.inp_m_pn)
         self.layout.addRow("JLCPCB Code:", self.inp_j_pn)
@@ -319,14 +299,12 @@ class ComponentDialog(QDialog):
         self.layout.addRow("Quantity:", self.inp_qty)
         self.layout.addRow("Backup:", self.inp_backup)
         
-        # Quick link buttons to check component on browser
         ll = QHBoxLayout()
         b_m = QPushButton(qta.icon('fa5s.external-link-alt'), "Open Mouser"); b_m.clicked.connect(lambda: self.open_l(f"https://www.mouser.it/c/?q={self.inp_m_pn.text()}"))
         b_j = QPushButton(qta.icon('fa5s.external-link-alt'), "Open JLCPCB"); b_j.clicked.connect(lambda: self.open_l(f"https://jlcpcb.com/partdetail/{self.inp_j_pn.text()}"))
         ll.addWidget(b_m); ll.addWidget(b_j)
         self.layout.addRow(QLabel("Links:"), ll)
 
-        # Action Buttons (Save/Cancel)
         bb = QHBoxLayout()
         bs = QPushButton("Save"); bs.clicked.connect(self.accept)
         bc = QPushButton("Cancel"); bc.clicked.connect(self.reject)
@@ -334,33 +312,23 @@ class ComponentDialog(QDialog):
         self.layout.addRow(bb)
 
     def open_l(self, url): 
-        # Opens browser only if URL looks valid
         if url.split('=')[-1] and url.split('/')[-1]: webbrowser.open(url)
 
     def get_data(self):
-        """Returns a dictionary with user inputs."""
         return {'cat': self.inp_cat.currentText(), 'm_pn': self.inp_m_pn.text().replace("\n",""), 'j_pn': self.inp_j_pn.text().replace("\n",""), 'desc': self.inp_desc.text().replace("\n",""), 'qty': int(self.inp_qty.text()) if self.inp_qty.text().isdigit() else 1, 'backup': self.inp_backup.text()}
 
 class SettingsDialog(QDialog):
-    """
-    Dialog to manage global settings:
-    1. Mouser API Key
-    2. Database Path (create or switch file)
-    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.resize(500, 250)
         self.settings = QSettings("MySoft", "BOMManager")
-        
         layout = QVBoxLayout(self)
         form = QFormLayout()
         
-        # Mouser API Key Field
         self.i_m = QLineEdit(self.settings.value("mouser_key", ""))
         form.addRow("Mouser API Key:", self.i_m)
         
-        # Current DB Path Display
         current_db = self.settings.value("db_path", "Not Set")
         self.lbl_db = QLabel(current_db)
         self.lbl_db.setStyleSheet("color: gray; font-size: 10px; font-family: monospace;")
@@ -369,82 +337,65 @@ class SettingsDialog(QDialog):
         
         layout.addLayout(form)
         
-        # DB Management Buttons
         db_btn_layout = QHBoxLayout()
         btn_open_db = QPushButton("Select Existing DB")
         btn_open_db.clicked.connect(self.select_existing_db)
-        btn_open_db.setToolTip("Use this if the DB file already exists (e.g. on Dropbox/Drive)")
-        
         btn_new_db = QPushButton("Create New DB")
         btn_new_db.clicked.connect(self.create_new_db)
-        
-        db_btn_layout.addWidget(btn_open_db)
-        db_btn_layout.addWidget(btn_new_db)
+        db_btn_layout.addWidget(btn_open_db); db_btn_layout.addWidget(btn_new_db)
         layout.addLayout(db_btn_layout)
-        
         layout.addStretch()
         
-        # Save Button
         b_save = QPushButton("Save and Close")
         b_save.clicked.connect(self.save_settings)
         layout.addWidget(b_save)
 
     def select_existing_db(self):
-        """Allows selecting an existing .db file."""
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Existing Database", "", "SQLite Database (*.db)")
         if file_path:
             self.settings.setValue("db_path", file_path)
             self.lbl_db.setText(file_path)
-            QMessageBox.warning(self, "Restart Required", "Path updated.\nPlease restart the application to load the new database.")
+            QMessageBox.warning(self, "Restart Required", "Path updated.\nPlease restart the application.")
 
     def create_new_db(self):
-        """Allows creating a new empty .db file."""
         file_path, _ = QFileDialog.getSaveFileName(self, "Create New Database", "my_bom_manager_new.db", "SQLite Database (*.db)")
         if file_path:
             self.settings.setValue("db_path", file_path)
             self.lbl_db.setText(file_path)
-            QMessageBox.warning(self, "Restart Required", "New path set.\nPlease restart the application to create and use the new database.")
+            QMessageBox.warning(self, "Restart Required", "New path set.\nPlease restart the application.")
 
     def save_settings(self):
         self.settings.setValue("mouser_key", self.i_m.text().strip())
         self.accept()
 
 # =============================================================================
-# 7. MAIN WINDOW
+# 6. MAIN WINDOW
 # =============================================================================
 class MainWindow(QMainWindow):
     def __init__(self, session_factory):
         super().__init__()
         self.setWindowTitle("BOM Manager Pro")
-        self.setWindowIcon(QIcon("icon.ico")) # App Icon
+        self.setWindowIcon(QIcon("icon.ico"))
         self.resize(1350, 850)
-        self.session = session_factory() # Create DB session
-        self.threadpool = QThreadPool()  # Thread pool for update workers
+        self.session = session_factory()
+        self.threadpool = QThreadPool()
         self.current_project = None
-        
-        # Totals Variables
-        self.tm = 0.0 # Mouser Total
-        self.tj = 0.0 # JLCPCB Total
-        self.hybrid_total = 0.0 # "Best Price" Total
-        
+        self.tm = 0.0; self.tj = 0.0; self.hybrid_total = 0.0
         self.init_ui()
         self.load_projects()
 
     def init_ui(self):
-        """Configures the graphical layout: Horizontal Splitter (Project List | BOM Table)."""
         mw = QWidget(); self.setCentralWidget(mw)
         ml = QHBoxLayout(mw); ml.setContentsMargins(0,0,0,0)
         sp = QSplitter(Qt.Orientation.Horizontal); ml.addWidget(sp)
 
-        # --- LEFT PANEL (Project List) ---
+        # LEFT PANEL
         left = QWidget(); ll = QVBoxLayout(left); ll.setContentsMargins(0,0,0,0)
         ll.addWidget(QLabel("  PROJECTS"))
         self.p_list = QListWidget()
         self.p_list.itemClicked.connect(self.select_project)
         self.p_list.setFont(QFont("sans-serif", 10))
         ll.addWidget(self.p_list)
-        
-        # New/Delete Project Buttons
         pb = QHBoxLayout()
         ba = QPushButton("New"); ba.clicked.connect(self.add_project)
         bd = QPushButton("Delete"); bd.clicked.connect(self.delete_project)
@@ -452,16 +403,13 @@ class MainWindow(QMainWindow):
         ll.addLayout(pb)
         sp.addWidget(left)
 
-        # --- RIGHT PANEL (BOM and Details) ---
+        # RIGHT PANEL
         right = QWidget(); rl = QVBoxLayout(right); rl.setContentsMargins(0,0,0,0)
-        
-        # Right Header (Project Title, Toolbar)
         head = QWidget(); hl = QHBoxLayout(head); head.setStyleSheet("background:#222; padding:5px;")
         
         self.lbl_t = QLabel("Select Project"); self.lbl_t.setStyleSheet("font-size:18px; font-weight:bold; border:none; background:none;")
         hl.addWidget(self.lbl_t)
         
-        # Toolbar Buttons (Edit Name, Notes, Export, Filters, Settings, Refresh)
         btn_edit = QPushButton(qta.icon('fa5s.pen'), "")
         btn_edit.setToolTip("Rename Project"); btn_edit.setFixedSize(30, 30); btn_edit.clicked.connect(self.rename_project)
         hl.addWidget(btn_edit)
@@ -471,7 +419,7 @@ class MainWindow(QMainWindow):
         hl.addWidget(btn_notes)
         hl.addStretch()
 
-        # Export Menu (CSV/PDF)
+        # Export
         btn_exp = QPushButton(qta.icon('fa5s.file-export'), "Export")
         menu_exp = QMenu()
         act_csv = QAction("Export CSV (Detailed)", self); act_csv.triggered.connect(self.export_csv)
@@ -480,7 +428,16 @@ class MainWindow(QMainWindow):
         btn_exp.setMenu(menu_exp)
         hl.addWidget(btn_exp)
         
-        # Category Filter
+        # --- NEW SORTING FEATURE ---
+        self.cmb_sort = QComboBox()
+        self.cmb_sort.addItems(["Sort by ID (Asc)", "Sort by JLC Stock (Asc)"])
+        self.cmb_sort.currentTextChanged.connect(lambda: self.load_bom()) # Reloads on change
+        hl.addWidget(QLabel("Sort:"))
+        hl.addWidget(self.cmb_sort)
+        hl.addSpacing(10)
+        # ---------------------------
+
+        # Filter
         self.cmb_f = QComboBox(); self.cmb_f.addItems(CATEGORIES)
         self.cmb_f.currentTextChanged.connect(self.apply_filter)
         hl.addWidget(QLabel("Filter:")); hl.addWidget(self.cmb_f); hl.addSpacing(10)
@@ -491,7 +448,7 @@ class MainWindow(QMainWindow):
         hl.addWidget(br)
         rl.addWidget(head)
 
-        # TABLE SETUP (QTableWidget)
+        # TABLE
         self.tab = QTableWidget()
         self.cols = ["ID", "Mouser PN", "JLC Code", "Cat", "Desc", "Qty", "Mouser", "JLCPCB"]
         self.tab.setColumnCount(len(self.cols)); self.tab.setHorizontalHeaderLabels(self.cols)
@@ -499,34 +456,27 @@ class MainWindow(QMainWindow):
         self.tab.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tab.doubleClicked.connect(self.edit_component)
         self.tab.setStyleSheet("QTableWidget{background:#1e1e1e; color:#ddd; gridline-color:#333;}")
-        
-        # Text display optimizations
-        self.tab.setWordWrap(True) # Wrap text
-        self.tab.setTextElideMode(Qt.TextElideMode.ElideNone) # Disable "..." elision
+        self.tab.setWordWrap(True)
+        self.tab.setTextElideMode(Qt.TextElideMode.ElideNone)
         
         header = self.tab.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents) # Fit to content
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) # Description takes remaining space
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
 
         rl.addWidget(self.tab)
 
-        # Component Management Buttons (Add/Remove)
         act = QHBoxLayout()
         bac = QPushButton("Add Component"); bac.clicked.connect(self.add_component)
         brc = QPushButton("Remove"); brc.clicked.connect(self.del_component)
         act.addWidget(bac); act.addWidget(brc); act.addStretch()
         rl.addLayout(act)
 
-        # Footer with Totals
         self.lbl_stat = QLabel("Totals: -"); self.lbl_stat.setStyleSheet("background:#007acc; padding:10px; font-weight:bold;")
         rl.addWidget(self.lbl_stat)
         
-        # Set splitter proportions
         sp.addWidget(right); sp.setSizes([200, 1100])
 
-    # --- HELPERS ---
     def get_last_refresh_date(self):
-        """Finds the most recent update date among all components."""
         dates = []
         if not self.current_project: return "Never"
         for c in self.current_project.components:
@@ -534,29 +484,23 @@ class MainWindow(QMainWindow):
         return max(dates) if dates else "Never"
 
     def calculate_unit(self, total, qty):
-        """Calculates unit price."""
         if qty <= 0: return 0.0
         return total / qty
 
-    # --- PROJECTS & NOTES LOGIC ---
     def rename_project(self):
-        """Renames the current project in the DB."""
         if not self.current_project: return
         new_n, ok = QInputDialog.getText(self, "Rename", "New name:", text=self.current_project.name)
         if ok and new_n:
             try:
                 self.current_project.name = new_n; self.session.commit()
                 self.lbl_t.setText(new_n); self.load_projects()
-            except Exception as e: QMessageBox.warning(self, "Error", f"Error (duplicate name?): {e}")
+            except Exception as e: QMessageBox.warning(self, "Error", f"Error: {e}")
 
     def open_notes(self):
-        """Opens the notes dialog."""
         if not self.current_project: return
         NotesDialog(self, self.current_project).exec()
 
-    # --- EXPORT CSV ---
     def export_csv(self):
-        """Exports the current BOM to a CSV file."""
         if not self.current_project: return
         path, _ = QFileDialog.getSaveFileName(self, "Save CSV", f"{self.current_project.name}.csv", "CSV Files (*.csv)")
         if path:
@@ -574,7 +518,6 @@ class MainWindow(QMainWindow):
                     writer.writerow(headers)
                     
                     for c in self.current_project.components:
-                        # Logic to handle N/A values
                         m_ok = c.last_mouser_stock >= c.target_qty
                         m_stk = c.last_mouser_stock if c.last_mouser_stock > -1 else "N/A"
                         m_tot = c.last_mouser_price if m_ok else 0.0
@@ -593,38 +536,26 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Export", "CSV Saved!")
             except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
-    # --- EXPORT PDF (COMPACT CARD LAYOUT) ---
     def export_pdf(self):
-        """
-        Generates a PDF formatted with a "Card Slim" layout.
-        Constructs HTML/CSS strings and uses xhtml2pdf for conversion.
-        """
         if not self.current_project: return
         path, _ = QFileDialog.getSaveFileName(self, "Save PDF", f"{self.current_project.name}.pdf", "PDF Files (*.pdf)")
         if not path: return
 
         cards_html = ""
-        
         for c in self.current_project.components:
-            # Availability calculations
             m_ok = c.last_mouser_stock >= c.target_qty
             j_ok = c.last_jlc_stock >= c.target_qty
-            
-            # Mouser Data Formatting (Green if OK, Red if No Stock)
             m_stk_style = "color: #2e7d32; font-weight:bold;" if m_ok else "color: #c62828;"
             m_stk_txt = f"{c.last_mouser_stock}" if c.last_mouser_stock > -1 else "N/A"
             m_price = f"{c.last_mouser_price:.2f} €" if m_ok else "-"
             m_unit = f"{self.calculate_unit(c.last_mouser_price, c.target_qty):.3f}" if m_ok else "-"
             
-            # JLC Data Formatting
             j_stk_style = "color: #1565c0; font-weight:bold;" if j_ok else "color: #c62828;"
             j_stk_txt = f"{c.last_jlc_stock}" if c.last_jlc_stock > -1 else "N/A"
             j_price = f"{c.last_jlc_price:.2f} €" if j_ok else "-"
             j_unit = f"{self.calculate_unit(c.last_jlc_price, c.target_qty):.3f}" if j_ok else "-"
 
-            # "Winner" logic (lowest price with stock) to highlight the cell
-            winner_m = False
-            winner_j = False
+            winner_m = False; winner_j = False
             if m_ok and j_ok:
                 if c.last_mouser_price < c.last_jlc_price: winner_m = True
                 else: winner_j = True
@@ -636,43 +567,26 @@ class MainWindow(QMainWindow):
             m_border = "2px solid #4caf50" if winner_m else "1px solid #ddd"
             j_border = "2px solid #2196f3" if winner_j else "1px solid #ddd"
 
-            # HTML construction of the component "Card"
             cards_html += f"""
             <div class="card">
                 <div class="card-header">
                     <table width="100%">
                         <tr>
-                            <td width="85%">
-                                <div><span class="cat-badge">{c.category}</span> <span class="desc">{c.description}</span></div>
-                            </td>
-                            <td width="15%" align="right">
-                                <div class="qty-line"><b>x{c.target_qty}</b></div>
-                            </td>
+                            <td width="85%"><div><span class="cat-badge">{c.category}</span> <span class="desc">{c.description}</span></div></td>
+                            <td width="15%" align="right"><div class="qty-line"><b>x{c.target_qty}</b></div></td>
                         </tr>
                     </table>
                 </div>
-
                 <table class="card-body" cellspacing="2">
                     <tr>
                         <td width="50%" class="vendor-box" style="background-color: {m_bg}; border: {m_border};">
-                            <div class="row-flex">
-                                <span class="v-title" style="color:#2e7d32;">MOUSER</span>
-                                <span class="pn">{c.mouser_part_number}</span>
-                            </div>
-                            <div class="metrics-row">
-                                Stk: <span style="{m_stk_style}">{m_stk_txt}</span> | Unit: {m_unit}
-                            </div>
+                            <div class="row-flex"><span class="v-title" style="color:#2e7d32;">MOUSER</span><span class="pn">{c.mouser_part_number}</span></div>
+                            <div class="metrics-row">Stk: <span style="{m_stk_style}">{m_stk_txt}</span> | Unit: {m_unit}</div>
                             <div class="total-price">TOT: {m_price}</div>
                         </td>
-
                         <td width="50%" class="vendor-box" style="background-color: {j_bg}; border: {j_border};">
-                            <div class="row-flex">
-                                <span class="v-title" style="color:#1565c0;">JLCPCB</span>
-                                <span class="pn">{c.jlc_part_number}</span>
-                            </div>
-                            <div class="metrics-row">
-                                Stk: <span style="{j_stk_style}">{j_stk_txt}</span> | Unit: {j_unit}
-                            </div>
+                            <div class="row-flex"><span class="v-title" style="color:#1565c0;">JLCPCB</span><span class="pn">{c.jlc_part_number}</span></div>
+                            <div class="metrics-row">Stk: <span style="{j_stk_style}">{j_stk_txt}</span> | Unit: {j_unit}</div>
                             <div class="total-price">TOT: {j_price}</div>
                         </td>
                     </tr>
@@ -684,62 +598,42 @@ class MainWindow(QMainWindow):
         if self.current_project.notes:
             notes_html = f"<div class='notes'><h3>Notes:</h3><p>{self.current_project.notes.replace(chr(10), '<br>')}</p></div>"
 
-        # Complete HTML structure with embedded CSS
         html_content = f"""
-        <html>
-        <head>
-            <style>
-                @page {{ size: a4 portrait; margin: 1cm; }}
-                body {{ font-family: Helvetica, Arial, sans-serif; color: #333; font-size: 9px; }}
-                /* CSS Omitted for brevity (same as logic above) */
-                h1 {{ font-size: 18px; color: #222; border-bottom: 2px solid #007acc; padding-bottom: 5px; margin-bottom: 10px; }}
-                .meta {{ font-size: 9px; color: #666; margin-bottom: 15px; }}
-                .card {{ border: 1px solid #ccc; background-color: #fff; margin-bottom: 8px; page-break-inside: avoid; }}
-                .card-header {{ background-color: #f0f0f0; padding: 3px 5px; border-bottom: 1px solid #ddd; }}
-                .desc {{ font-size: 10px; font-weight: bold; color: #000; word-wrap: break-word; }}
-                .cat-badge {{ font-size: 8px; background: #666; color: white; padding: 1px 4px; border-radius: 3px; font-weight: normal; margin-right: 5px; }}
-                .qty-line {{ font-size: 11px; color: #000; text-align: right; }}
-                .card-body {{ width: 100%; }}
-                .vendor-box {{ padding: 3px; vertical-align: top; }}
-                .row-flex {{ margin-bottom: 2px; border-bottom: 1px solid rgba(0,0,0,0.05); padding-bottom: 1px; }}
-                .v-title {{ font-size: 9px; font-weight: bold; margin-right: 5px; }}
-                .pn {{ font-family: Consolas; font-size: 9px; color: #444; word-wrap: break-word; font-weight: bold;}}
-                .metrics-row {{ font-size: 9px; color: #333; margin-bottom: 1px; }}
-                .total-price {{ font-size: 10px; font-weight: bold; text-align: right; margin-top: 1px; }}
-                .notes {{ background: #ffffea; border: 1px solid #e0e0a0; padding: 5px; font-size: 9px; }}
-            </style>
-        </head>
+        <html><head><style>
+            @page {{ size: a4 portrait; margin: 1cm; }}
+            body {{ font-family: Helvetica, Arial, sans-serif; color: #333; font-size: 9px; }}
+            h1 {{ font-size: 18px; color: #222; border-bottom: 2px solid #007acc; padding-bottom: 5px; margin-bottom: 10px; }}
+            .meta {{ font-size: 9px; color: #666; margin-bottom: 15px; }}
+            .card {{ border: 1px solid #ccc; background-color: #fff; margin-bottom: 8px; page-break-inside: avoid; }}
+            .card-header {{ background-color: #f0f0f0; padding: 3px 5px; border-bottom: 1px solid #ddd; }}
+            .desc {{ font-size: 10px; font-weight: bold; color: #000; word-wrap: break-word; }}
+            .cat-badge {{ font-size: 8px; background: #666; color: white; padding: 1px 4px; border-radius: 3px; font-weight: normal; margin-right: 5px; }}
+            .qty-line {{ font-size: 11px; color: #000; text-align: right; }}
+            .card-body {{ width: 100%; }}
+            .vendor-box {{ padding: 3px; vertical-align: top; }}
+            .row-flex {{ margin-bottom: 2px; border-bottom: 1px solid rgba(0,0,0,0.05); padding-bottom: 1px; }}
+            .v-title {{ font-size: 9px; font-weight: bold; margin-right: 5px; }}
+            .pn {{ font-family: Consolas; font-size: 9px; color: #444; word-wrap: break-word; font-weight: bold;}}
+            .metrics-row {{ font-size: 9px; color: #333; margin-bottom: 1px; }}
+            .total-price {{ font-size: 10px; font-weight: bold; text-align: right; margin-top: 1px; }}
+            .notes {{ background: #ffffea; border: 1px solid #e0e0a0; padding: 5px; font-size: 9px; }}
+        </style></head>
         <body>
             <h1>BOM: {self.current_project.name}</h1>
-            <div class="meta">
-                Generated: {datetime.now().strftime('%d/%m/%Y %H:%M')} | Data updated: {self.get_last_refresh_date()}
-            </div>
-            
+            <div class="meta">Generated: {datetime.now().strftime('%d/%m/%Y %H:%M')} | Data updated: {self.get_last_refresh_date()}</div>
             {cards_html}
-            
             <hr>
             <h3><b>MOUSER: {self.tm:.2f}€  |   JLCPCB: {self.tj:.2f}€   |   HYBRID (BEST): {self.hybrid_total:.2f}€</b></h3>
-
             {notes_html}
-        </body>
-        </html>
+        </body></html>
         """
-
         try:
-            # PDF Generation
-            with open(path, "wb") as pdf_file:
-                pisa_status = pisa.CreatePDF(html_content, dest=pdf_file)
-            
-            if pisa_status.err:
-                QMessageBox.critical(self, "Error", "Error creating PDF")
-            else:
-                QMessageBox.information(self, "Export", "PDF created successfully!")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            with open(path, "wb") as pdf_file: pisa_status = pisa.CreatePDF(html_content, dest=pdf_file)
+            if pisa_status.err: QMessageBox.critical(self, "Error", "Error creating PDF")
+            else: QMessageBox.information(self, "Export", "PDF created successfully!")
+        except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
-    # --- STANDARD CRUD METHODS (Create, Read, Update, Delete) ---
     def load_projects(self):
-        """Loads the project list from the DB into the sidebar list."""
         self.p_list.clear()
         for p in self.session.query(Project).all():
             it = QListWidgetItem(p.name); it.setData(Qt.ItemDataRole.UserRole, p.id)
@@ -763,13 +657,28 @@ class MainWindow(QMainWindow):
         self.load_bom()
 
     def load_bom(self):
-        """Populates the central table with components of the selected project."""
+        """
+        Modified to support Sorting.
+        """
         if not self.current_project: return
         self.tab.setRowCount(0)
-        comps = self.current_project.components
+        
+        # 1. Fetch components into a list
+        comps = list(self.current_project.components)
+        
+        # 2. Sorting Logic
+        sort_mode = self.cmb_sort.currentText()
+        if "ID" in sort_mode:
+            comps.sort(key=lambda x: x.id) # Sort by ID ascending
+        elif "JLC Stock" in sort_mode:
+            # Sort by Stock. Note: -1 (N/A) will appear first in ascending order
+            comps.sort(key=lambda x: x.last_jlc_stock)
+
         self.tab.setRowCount(len(comps))
         for r, c in enumerate(comps): self.render_row(r, c)
-        self.apply_filter(self.cmb_f.currentText()); self.calc_total()
+        
+        self.apply_filter(self.cmb_f.currentText())
+        self.calc_total()
         self.tab.resizeRowsToContents()
 
     def render_row(self, r, c):
@@ -832,7 +741,7 @@ class MainWindow(QMainWindow):
         if c:
             c.last_mouser_stock = data['mouser_stock']; c.last_mouser_price = data['mouser_price']
             c.last_jlc_stock = data['jlc_stock']; c.last_jlc_price = data['jlc_price']
-            c.last_update = data['timestamp'] # Save refresh timestamp
+            c.last_update = data['timestamp']
             self.session.commit()
             for r in range(self.tab.rowCount()):
                 if self.tab.item(r,0).text() == str(c.id): self.render_row(r, c); break
@@ -840,38 +749,25 @@ class MainWindow(QMainWindow):
         self.tab.resizeRowsToContents()
 
     def calc_total(self):
-        tm = 0.0
-        tj = 0.0
-        hybrid_total = 0.0
-        
+        tm = 0.0; tj = 0.0; hybrid_total = 0.0
         if self.current_project:
             for c in self.current_project.components:
-                # Validity check
                 m_ok = c.last_mouser_stock >= c.target_qty
                 j_ok = c.last_jlc_stock >= c.target_qty
-                
-                # Individual totals
                 if m_ok: tm += c.last_mouser_price
                 if j_ok: tj += c.last_jlc_price
-                
-                # Hybrid Total (Best Price Logic)
                 price_m = c.last_mouser_price if m_ok else float('inf')
                 price_j = c.last_jlc_price if j_ok else float('inf')
-                
                 best = min(price_m, price_j)
-                if best != float('inf'):
-                    hybrid_total += best
+                if best != float('inf'): hybrid_total += best
 
-        self.tm = tm
-        self.tj = tj
-        self.hybrid_total = hybrid_total
+        self.tm = tm; self.tj = tj; self.hybrid_total = hybrid_total
         self.lbl_stat.setText(f"MOUSER: {tm:.2f}€   |   JLCPCB: {tj:.2f}€   |   ⚡ HYBRID (BEST): {hybrid_total:.2f}€")
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     
-    # SETUP PALETTE (Dark Theme)
     p = QPalette()
     p.setColor(QPalette.ColorRole.Window, QColor(30,30,30)); p.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
     p.setColor(QPalette.ColorRole.Base, QColor(25,25,25)); p.setColor(QPalette.ColorRole.AlternateBase, QColor(30,30,30))
@@ -881,54 +777,39 @@ def main():
     p.setColor(QPalette.ColorRole.Highlight, QColor(0, 122, 204)); p.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
     app.setPalette(p)
 
-    # --- SETUP DATABASE AND FIRST RUN ---
     settings = QSettings("MySoft", "BOMManager")
     db_path = settings.value("db_path", "")
     
-    # If no DB path is saved
     if not db_path:
-        # Create a custom QMessageBox for initial choice
         msg = QMessageBox()
         msg.setWindowTitle("BOM Manager - Initial Setup")
         msg.setText("Welcome! No database configured.")
-        msg.setInformativeText("Do you want to create a new file or open an existing one (e.g., from Cloud)?")
-        
-        # Add custom buttons
+        msg.setInformativeText("Do you want to create a new file or open an existing one?")
         btn_new = msg.addButton("✨ Create New", QMessageBox.ButtonRole.ActionRole)
         btn_open = msg.addButton("📂 Open Existing", QMessageBox.ButtonRole.ActionRole)
         btn_cancel = msg.addButton("Exit", QMessageBox.ButtonRole.RejectRole)
-        
         msg.exec()
 
-        if msg.clickedButton() == btn_cancel:
-            sys.exit(0)
-        
+        if msg.clickedButton() == btn_cancel: sys.exit(0)
         elif msg.clickedButton() == btn_new:
-            # SAVE FILE NAME (Create New)
             file_path, _ = QFileDialog.getSaveFileName(None, "Create New Database", "my_bom_manager.db", "SQLite Database (*.db)")
             if file_path:
                 settings.setValue("db_path", file_path)
                 db_path = file_path
-                with open(db_path, 'w'): pass # Creates file
-            else:
-                sys.exit(0)
-
+                with open(db_path, 'w'): pass
+            else: sys.exit(0)
         elif msg.clickedButton() == btn_open:
-            # OPEN FILE NAME (Open Existing - Safe, no overwrite)
             file_path, _ = QFileDialog.getOpenFileName(None, "Select Existing Database", "", "SQLite Database (*.db)")
             if file_path:
                 settings.setValue("db_path", file_path)
                 db_path = file_path
-            else:
-                sys.exit(0)
+            else: sys.exit(0)
 
-    # Check file existence before loading (if it was deleted manually)
     if not os.path.exists(db_path):
-        QMessageBox.critical(None, "Database Error", f"The database file does not exist:\n{db_path}\n\nRestart and select 'Create New' or 'Open Existing'.")
-        settings.remove("db_path") # Reset setting
+        QMessageBox.critical(None, "Database Error", f"The database file does not exist:\n{db_path}")
+        settings.remove("db_path")
         sys.exit(1)
 
-    # Initialize DB and Session
     session_factory = init_db(db_path)
     w = MainWindow(session_factory)
     w.showMaximized()
